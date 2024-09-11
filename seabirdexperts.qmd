@@ -1,0 +1,126 @@
+---
+title: "Seabird Expert Opinion Elicitation"
+format: 
+  html:
+    code-fold: true
+---
+
+```{r}
+#| label: setup
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(patchwork)
+theme_set(theme_classic())
+set.seed(1737)
+
+```
+
+Where them birds at? Theoretical example of bias correction.
+
+Known: 10 species' relative utilization of the lease areas.
+
+Unknown: 5 species' relative utilization of the lease areas.
+
+How: 8 experts give their opinion. We use their biases from the known species to correct the estimates for the unknown species.
+
+Here's our simulated data. Note: it's nonsense. Don't worry, this is just to demonstrate the bias correction method.
+
+```{r}
+#| label: data
+
+known_species <- c("PFSH", "COMU", "ASSP", "SOSH", "LAAL", "BFAL", "WEGU", "SCMU", "PIGU", "CATE")
+unknown_species <- c("STAL", "RFBO", "HAPT", "RBTR", "BRBO")
+seabird_df <- tibble(
+  species = known_species,
+  utilization = runif(length(known_species), 0.01, 0.03)
+)
+experts <- c("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel")
+
+arrange(seabird_df, desc(utilization))
+```
+
+Let's generate some expert opinions. We're going to make some assumptions about the errors. We'll represent error as $\epsilon = \frac{\hat{\upsilon}}{\upsilon}$ where $\epsilon$ is the ratio of the observed utilization ( $\hat{\upsilon}$ ) to the expert opinion utilization ( $\upsilon$ ).
+
+1.  Expert opinions will be more accurate for higher utilization species. I.e., $\epsilon \rightarrow 1$ and $\sigma_\epsilon \rightarrow 0$ for large values of $\hat{\upsilon}$ (heteroscedastic).
+
+2.  Expert opinions will be biased high for lower utilization species. I.e., $\epsilon \gg 1$ for small values of $\hat{\upsilon}$.
+
+3.  Expert opinion will vary by expert. I.e., a random effect on expert ( $\chi$ ).
+
+4.  Log-fold change ( $log(\epsilon)$ ) is normally distributed.
+
+The model looks like this:
+
+$$
+\begin{align}
+log(\epsilon) &\sim Normal(\mu, \sigma_{\epsilon}) \\
+\mu_i &= \alpha_\mu + \beta_\mu \hat{\upsilon} + Z[\chi_i] \\
+log(\sigma_{\epsilon}) &= \alpha_\sigma + \beta_\sigma \hat{\upsilon} \\
+\alpha_\mu, \beta_\mu, \alpha_\sigma, \beta_\sigma &\sim Normal(0, 5) \\
+Z &\sim Normal(0, \sigma_Z) \\
+\sigma_Z &\sim Exponential(1) \\
+\end{align}
+$$
+
+Let's simulate some opinions.
+
+```{r}
+#| label: opinions
+
+# Parameters
+alpha_mu <- 0.2
+beta_mu <- -0.1
+alpha_sig <- -2.25
+beta_sig <- -0.1
+sigma_Z <- 0.1
+Z <- rnorm(length(experts), 0, sigma_Z)
+names(Z) <- experts
+
+# Simulations
+standardize <- function(x) (x - mean(x)) / sd(x)
+opinions <- tibble(expert = experts) %>% 
+  cross_join(seabird_df) %>% 
+  mutate(utilization_std = standardize(utilization),
+         mu = alpha_mu + beta_mu * utilization_std + Z[expert],
+         sigma_ep = exp(alpha_sig + beta_sig * utilization_std),
+         log_epsilon = rnorm(nrow(.), mu, sigma_ep),
+         epsilon = exp(log_epsilon),
+         opinion = utilization * epsilon)
+
+epsilon_plot <- ggplot(opinions, aes(utilization, epsilon)) +
+  geom_hline(yintercept = 1, color = "grey80") +
+  geom_pointrange(
+    aes(ymin = epsilon_lwr, ymax = epsilon_upr),
+    opinions %>% 
+      group_by(species, utilization) %>% 
+      summarize(epsilon_lwr = mean(epsilon) - sd(epsilon),
+                epsilon_upr = mean(epsilon) + sd(epsilon),
+                epsilon = mean(epsilon),
+                .groups = "drop")
+  ) +
+  geom_point(aes(color = expert), alpha = 0.5) +
+  ylab(expression(epsilon)) +
+  expand_limits(y = 0)
+opinion_plot <- ggplot(opinions, aes(utilization, opinion)) +
+  geom_pointrange(
+    aes(ymin = opinion_lwr, ymax = opinion_upr),
+    opinions %>% 
+      group_by(species, utilization) %>% 
+      summarize(opinion_lwr = mean(opinion) - sd(opinion),
+                opinion_upr = mean(opinion) + sd(opinion),
+                opinion = mean(opinion),
+                .groups = "drop")
+  ) +
+  geom_point(aes(color = expert), alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0) +
+  coord_fixed(xlim = c(0.01, 0.0375),
+              ylim = c(0.01, 0.0375))
+(epsilon_plot | opinion_plot) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+```
+
+On the left, we see the ratio of opinion to utilization, $\epsilon$, decreases from \~1.5 towards 1 for species with higher utilizations. On the right, opinions are biased high relative to the modeled utilization (most points fall above the dashed 1:1 line), but the relative error is greater for lower-utilization species.
