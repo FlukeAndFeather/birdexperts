@@ -13,9 +13,14 @@ format:
 library(tidyverse)
 library(patchwork)
 theme_set(theme_classic())
-set.seed(1737)
+set.seed(123)
+
+logit <- function(x) log(x / (1 - x))
+inv_logit <- function(x) exp(x) / (1 + exp(x))
 
 ```
+
+## Intro
 
 Where them birds at? Theoretical example of bias correction.
 
@@ -25,102 +30,133 @@ Unknown: 5 species' relative utilization of the lease areas.
 
 How: 8 experts give their opinion. We use their biases from the known species to correct the estimates for the unknown species.
 
-Here's our simulated data. Note: it's nonsense. Don't worry, this is just to demonstrate the bias correction method.
+## Model
 
-```{r}
-#| label: data
+Let's simulate some expert opinions. We're going to assume:
 
-known_species <- c("PFSH", "COMU", "ASSP", "SOSH", "LAAL", "BFAL", "WEGU", "SCMU", "PIGU", "CATE")
-unknown_species <- c("STAL", "RFBO", "HAPT", "RBTR", "BRBO")
-seabird_df <- tibble(
-  species = known_species,
-  utilization = runif(length(known_species), 0.01, 0.03)
-)
-experts <- c("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel")
+-   Experts tend to overestimate utilization
 
-arrange(seabird_df, desc(utilization))
-```
+-   Errors are correlated within experts and species (random effects)
 
-Let's generate some expert opinions. We're going to make some assumptions about the errors. We'll represent error as $\epsilon = \frac{\hat{\upsilon}}{\upsilon}$ where $\epsilon$ is the ratio of the observed utilization ( $\hat{\upsilon}$ ) to the expert opinion utilization ( $\upsilon$ ).
-
-1.  Expert opinions will be more accurate for higher utilization species. I.e., $\epsilon \rightarrow 1$ and $\sigma_\epsilon \rightarrow 0$ for large values of $\hat{\upsilon}$ (heteroscedastic).
-
-2.  Expert opinions will be biased high for lower utilization species. I.e., $\epsilon \gg 1$ for small values of $\hat{\upsilon}$.
-
-3.  Expert opinion will vary by expert. I.e., a random effect on expert ( $\chi$ ).
-
-4.  Log-fold change ( $log(\epsilon)$ ) is normally distributed.
-
-The model looks like this:
-
-$$
+The following model says the *i*-th utilization, $u_i$, is a beta (proportion 0-1) random variable with mean $\mu_i$ ( $\mu_i \in (0,1)$ ) and shape parameter $\phi$. The logit of $\mu$ is the sum of an intercept ( $\alpha$, which describes how much experts tend to overestimate as a whole), the mean of the expert opinions ( $o_{ij}$ ) with random intercepts per expert ( $Z_x$, i.e., each expert has their own offset ), and a random intercept for each species ( $Z_s$, i.e., each species' general misperception). We'll logit-transform opinions prior to model fitting. $$
 \begin{align}
-log(\epsilon) &\sim Normal(\mu, \sigma_{\epsilon}) \\
-\mu_i &= \alpha_\mu + \beta_\mu \hat{\upsilon} + Z[\chi_i] \\
-log(\sigma_{\epsilon}) &= \alpha_\sigma + \beta_\sigma \hat{\upsilon} \\
-\alpha_\mu, \beta_\mu, \alpha_\sigma, \beta_\sigma &\sim Normal(0, 5) \\
-Z &\sim Normal(0, \sigma_Z) \\
-\sigma_Z &\sim Exponential(1) \\
+u_i &\sim Beta(\mu_i, \phi) \\
+logit(\mu_i) &= \alpha + \frac{1}{X} \sum_{j=1}^X(o_{ij} + Z_x[x_j]) + Z_s[s_i] \\
+\phi &\sim Gamma(1, 10^{-5}) \\ 
+\alpha &\sim Normal(0, 5) \\
+Z_x &\sim Normal(0, \sigma_x) \\
+Z_s &\sim Normal(0, \sigma_s) \\
+\sigma_x, \sigma_s &\sim Exponential(1)
 \end{align}
 $$
 
-Let's simulate some opinions.
+Structuring the model this way allows us to estimate the value of interest (utilization, $u$) from the predictors we'll have available, the opinion ( $o$ ) and the identity of the expert ( $x$ ). When we get to unknown species stage, we won't have the random effect for the unknown species ( $Z_s$ ). BUT we'll have an estimate for the distribution of $Z_s$ based on our estimate of $\sigma_s$, which will give us confidence intervals for our predicted $u$'s. Note the prior on $\phi$ looks batshit. That's a necessity because of how small the proportions involved are.
+
+### Simulation
+
+Here we simulate some species' "actual" utilizations and the expert opinions. The triangle is the utilization, points in color indicate experts' opinions. The black point with lines is the mean and standard deviation of the expert opinions. I've highlighted two experts (Foxtrot and Hotel) with larger, more solid points.
+
+A couple things to notice:
+
+1.  Experts generally overestimate species' utilizations. I.e., the black points and lines tend to be to the right of the triangles. You can tune this with the $\alpha$ parameter.
+2.  The degree of overestimation is correlated within experts. E.g., Foxtrot (blue) has a tendency to guess the highest, Hotel (pink) tends to guess the lowest. You can tune this with the $\sigma_x$ parameter.
+3.  Opinions are correlated within species. E.g., everyone guessed way too high for LAAL, but tended to be kind of low for SCMU. You can tune this with the $\sigma_s$ parameter.
 
 ```{r}
-#| label: opinions
+#| label: simulate
 
-# Parameters
-alpha_mu <- 0.2
-beta_mu <- -0.1
-alpha_sig <- -2.25
-beta_sig <- -0.1
-sigma_Z <- 0.1
-Z <- rnorm(length(experts), 0, sigma_Z)
-names(Z) <- experts
+# Species and experts
+known_species <- c("PFSH", "COMU", "ASSP", "SOSH", "LAAL", "BFAL", "WEGU", "SCMU", "PIGU", "CATE")
+unknown_species <- c("STAL", "RFBO", "HAPT", "RBTR", "BRBO")
+experts <- c("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel")
 
-# Simulations
-standardize <- function(x) (x - mean(x)) / sd(x)
-opinions <- tibble(expert = experts) %>% 
-  cross_join(seabird_df) %>% 
-  mutate(utilization_std = standardize(utilization),
-         mu = alpha_mu + beta_mu * utilization_std + Z[expert],
-         sigma_ep = exp(alpha_sig + beta_sig * utilization_std),
-         log_epsilon = rnorm(nrow(.), mu, sigma_ep),
-         epsilon = exp(log_epsilon),
-         opinion = utilization * epsilon)
+# Simulation 
+alpha <- -0.5
+phi <- 1e4
+sigma_x <- 0.1
+sigma_s <- 0.2
+Zx <- rnorm(length(experts), 0, sigma_x)
+names(Zx) <- experts
+Zs <- rnorm(length(known_species), 0, sigma_s)
+names(Zs) <- known_species
 
-epsilon_plot <- ggplot(opinions, aes(utilization, epsilon)) +
-  geom_hline(yintercept = 1, color = "grey80") +
-  geom_pointrange(
-    aes(ymin = epsilon_lwr, ymax = epsilon_upr),
-    opinions %>% 
-      group_by(species, utilization) %>% 
-      summarize(epsilon_lwr = mean(epsilon) - sd(epsilon),
-                epsilon_upr = mean(epsilon) + sd(epsilon),
-                epsilon = mean(epsilon),
-                .groups = "drop")
-  ) +
-  geom_point(aes(color = expert), alpha = 0.5) +
-  ylab(expression(epsilon)) +
-  expand_limits(y = 0)
-opinion_plot <- ggplot(opinions, aes(utilization, opinion)) +
-  geom_pointrange(
-    aes(ymin = opinion_lwr, ymax = opinion_upr),
-    opinions %>% 
-      group_by(species, utilization) %>% 
-      summarize(opinion_lwr = mean(opinion) - sd(opinion),
-                opinion_upr = mean(opinion) + sd(opinion),
-                opinion = mean(opinion),
-                .groups = "drop")
-  ) +
-  geom_point(aes(color = expert), alpha = 0.5) +
-  geom_abline(slope = 1, intercept = 0) +
-  coord_fixed(xlim = c(0.01, 0.0375),
-              ylim = c(0.01, 0.0375))
-(epsilon_plot | opinion_plot) +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "bottom")
+# Create dummy utilizations so opinions cluster around something reasonable
+dummy_u <- runif(length(known_species), 0.0001, 0.003)
+names(dummy_u) <- known_species
+
+opinions <- expand_grid(expert = experts,
+                        species = known_species) %>% 
+  mutate(logit_opin = rnorm(
+    nrow(.), 
+    logit(dummy_u[species]) + Zx[expert] + Zs[species], 
+    0.25
+  ),
+  opinion = inv_logit(logit_opin))
+
+utilizations <- opinions %>% 
+  group_by(species) %>% 
+  summarize(logit_mu = alpha + mean(logit_opin + Zx[expert]) + Zs[species[1]]) %>% 
+  mutate(mu = inv_logit(logit_mu),
+         shape1 = mu * phi,
+         shape2 = (1 - mu) * phi,
+         utilization = rbeta(nrow(.), shape1, shape2),
+         species2 = fct_reorder(species, utilization))
+
+opinions$species2 = factor(opinions$species, 
+                           levels = levels(utilizations$species2))
+
+opin_summ <- opinions %>% 
+  group_by(species2) %>% 
+  summarize(opinion_lwr = mean(opinion) - sd(opinion),
+            opinion_upr = mean(opinion) + sd(opinion),
+            opinion = mean(opinion))
+
+Zx_min <- names(Zx)[which.min(Zx)]
+Zx_max <- names(Zx)[which.max(Zx)]
+ggplot(utilizations, aes(x = utilization, y = species2)) +
+  geom_point(aes(x = opinion, y = species, color = expert),
+             opinions,
+             alpha = 0.5) +
+  geom_point(aes(x = opinion, y = species, color = expert),
+             filter(opinions, expert %in% c(Zx_min, Zx_max)),
+             size = 3) +
+  geom_pointrange(aes(x = opinion,
+                      xmin = opinion_lwr, 
+                      xmax = opinion_upr),
+                  opin_summ,
+                  shape = 10) +
+  geom_point(size = 2, shape = 6)
 
 ```
 
-On the left, we see the ratio of opinion to utilization, $\epsilon$, decreases from \~1.5 towards 1 for species with higher utilizations. On the right, opinions are biased high relative to the modeled utilization (most points fall above the dashed 1:1 line), but the relative error is greater for lower-utilization species.
+### Model fitting
+
+Cool. Now let's fit the model.
+
+```{r}
+#| label: fit-model
+#| execute: false
+
+opinions_wide <- opinions %>% 
+  select(expert, species, opinion) %>% 
+  pivot_wider(names_from = expert, values_from = opinion) %>% 
+  arrange(species)
+opinions_matrix <- as.matrix(opinions_wide[, -1])
+
+char_to_int <- function(x) as.integer(factor(x))
+stan_data <- list(
+  S = length(known_species),
+  X = length(experts),
+  u = utilizations$utilization,
+  o = opinions_matrix,
+  s = char_to_int(utilizations$species),
+  x = char_to_int(colnames(opinions_matrix))
+)
+
+model <- rstan::stan("seabirdexperts.stan", 
+                     data = stan_data, 
+                     chains = 4,
+                     cores = 4,
+                     iter = 5000)
+
+```
